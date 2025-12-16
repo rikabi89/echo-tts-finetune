@@ -42,7 +42,7 @@ Inference :
 
 In this example I trained arabic, but English is possible of course. And theory a different language. 
 
-I am not an expert. This could be a bad way of doing things, test, improve etc. As such I probably can't help with any techical queries. 
+I am not an expert. This could be a bad way of doing things, test, improve etc. As such I probably can't help with any techical queries. ALSO I AM SORRY IF THIS DOES NOT WORK FOR YOU, BUT AT LEAST YOU HAVE AN IDEA.
 
 
 
