@@ -1,3 +1,4 @@
+Tested on WSL2 5090 only.
 
 This is a very rough script finetune script I vibecoded. There is a dataprep script, the idea is to drag audio files into a folder, then the script preps the dataset/metadata. Then finetune script.
 
