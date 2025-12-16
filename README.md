@@ -1,3 +1,50 @@
+
+This is a very rough script finetune script I vibecoded. There is a dataprep script, the idea is to drag audio files into a folder, then the script preps the dataset/metadata. Then finetune script.
+
+Install echo-tts as normal.
+
+
+1 . python finetune_cli.py prepare \
+  --raw_dir "/mnt/h/XX/XX/New folder/New folder" \
+  --segments_dir "datasets/XX/ar/segments" \
+  --max_duration 30
+
+
+2. python finetune_cli.py transcribe \
+  --segments_dir "datasets/XX/ar/segments" \
+  --metadata "datasets/XX/ar/metadata.jsonl" \
+  --lang ar
+
+
+
+3. python finetune_cli.py train \
+  --resume "checkpoints/echo_arabic_base/echo_abu_step16000.pt" \
+  --segments_dir "Arabic_Base/segments" \
+  --metadata "Arabic_Base/metadata.jsonl" \
+  --out_dir "checkpoints/echo_arabic_base" \
+  --lang ar \
+  --batch_size 2 \
+  --steps 20000 \
+  --lr 2e-5 \
+  --device cuda \
+
+Inference :
+4. python infer_cli.py \
+  --checkpoint checkpoints/echo_abu_ar/echo_abu_final.pt \
+  --speaker "/mnt/h/Audio/AbuTala/New folder/abu30sec.mp3" \
+  --text "[S1] في يوم من الأيام، شاب فقير قرر يتحدى العالم، خسر كثير، لكنه تعلّم أكثر، واليوم صوته يحمل وجع الماضي وقوة الإصرار." \
+  --out outputs/abu_ar_final_test.wav \
+  --device cuda \
+  --num_steps 40 \
+  --cfg_text 7.0 \
+  --cfg_speaker 1.1 \
+
+In this example I trained arabic, but English is possible of course. And theory a different language. 
+
+I am not an expert. This could be a bad way of doing things, test, improve etc. As such I probably can't help with any techical queries. 
+
+
+
 # Echo-TTS
 
 A multi-speaker text-to-speech model with speaker reference conditioning. See the [blog post](https://jordandarefsky.com/blog/2025/echo/) for technical details.
