@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchaudio
 from tqdm import tqdm
 import whisper
-import wandb  # <--- NEW: Import WandB
+import wandb
 
 from inference import (
     load_model_from_hf,
@@ -53,6 +54,14 @@ def list_audio_files(root: Path) -> List[Path]:
         ]
     )
 
+def logit_normal_sample(shape, device, sigma=1.0):
+    """
+    Samples timesteps from a Logit-Normal distribution.
+    This concentrates sampling in the 'middle' (t=0.5) where the model learns the most.
+    """
+    normal_sample = torch.randn(shape, device=device) * sigma
+    t = torch.sigmoid(normal_sample)
+    return t
 
 # --------------------------------------------------------------------------------------
 # 1️⃣ PREPARE
@@ -71,27 +80,30 @@ def cmd_prepare(raw_dir: Path, segments_dir: Path, max_duration: int = 30) -> No
     max_samples = int(44_100 * max_duration)
 
     for in_path in tqdm(files, desc="[Prepare] slicing", ncols=100):
-        wav, sr = torchaudio.load(str(in_path))
-        if sr != 44_100:
-            wav = torchaudio.functional.resample(wav, sr, 44_100)
-            sr = 44_100
+        try:
+            wav, sr = torchaudio.load(str(in_path))
+            if sr != 44_100:
+                wav = torchaudio.functional.resample(wav, sr, 44_100)
+                sr = 44_100
 
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
+            if wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
 
-        total = wav.shape[-1]
-        base = in_path.stem
+            total = wav.shape[-1]
+            base = in_path.stem
 
-        idx = 0
-        for start in range(0, total, max_samples):
-            end = min(start + max_samples, total)
-            chunk = wav[:, start:end]
-            if chunk.shape[-1] < int(0.5 * 44_100):
-                continue
-            out_name = f"{base}_{idx:03d}.wav"
-            out_path = segments_dir / out_name
-            torchaudio.save(str(out_path), chunk, sr)
-            idx += 1
+            idx = 0
+            for start in range(0, total, max_samples):
+                end = min(start + max_samples, total)
+                chunk = wav[:, start:end]
+                if chunk.shape[-1] < int(0.5 * 44_100):
+                    continue
+                out_name = f"{base}_{idx:03d}.wav"
+                out_path = segments_dir / out_name
+                torchaudio.save(str(out_path), chunk, sr)
+                idx += 1
+        except Exception as e:
+            print(f"Skipping {in_path}: {e}")
 
     print(f"[Prepare] Done. Segments in: {segments_dir}")
 
@@ -152,23 +164,26 @@ def cmd_transcribe(segments_dir: Path, metadata: Path, lang: str | None) -> None
     with metadata.open("a", encoding="utf-8") as fout:
         for p in tqdm(to_process, desc="[Transcribe] files", ncols=100):
             abs_path = p.resolve()
-            result = model.transcribe(
-                str(abs_path),
-                language=lang if lang else None,
-                task="transcribe",
-                verbose=False,
-            )
-            text = result.get("text", "").strip()
-            if not text:
-                continue
+            try:
+                result = model.transcribe(
+                    str(abs_path),
+                    language=lang if lang else None,
+                    task="transcribe",
+                    verbose=False,
+                )
+                text = result.get("text", "").strip()
+                if not text:
+                    continue
 
-            obj = {
-                "audio": str(abs_path),
-                "text": text,
-                "language": lang or result.get("language", None),
-            }
-            fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            new_count += 1
+                obj = {
+                    "audio": str(abs_path),
+                    "text": text,
+                    "language": lang or result.get("language", None),
+                }
+                fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                new_count += 1
+            except Exception as e:
+                print(f"Error transcribing {p}: {e}")
 
     print(f"[Transcribe] Added {new_count} new segments.")
 
@@ -226,15 +241,21 @@ def build_batch_latents(
     texts: List[str] = []
 
     for item in batch:
-        t_path = item["target"]["audio"]
-        t_text = item["target"]["text"]
-        t_audio = load_audio(t_path)
-        target_audio_list.append(t_audio)
-        texts.append(t_text)
+        try:
+            t_path = item["target"]["audio"]
+            t_text = item["target"]["text"]
+            t_audio = load_audio(t_path)
+            target_audio_list.append(t_audio)
+            texts.append(t_text)
 
-        r_path = item["reference"]["audio"]
-        r_audio = load_audio(r_path)
-        ref_audio_list.append(r_audio)
+            r_path = item["reference"]["audio"]
+            r_audio = load_audio(r_path)
+            ref_audio_list.append(r_audio)
+        except Exception as e:
+            print(f"Error loading audio in batch: {e}")
+            target_audio_list.append(torch.zeros(1, 44100))
+            ref_audio_list.append(torch.zeros(1, 44100))
+            texts.append("")
 
     # Targets
     target_batch = torch.zeros((B, 1, MAX_AUDIO_SAMPLES), dtype=torch.float32, device=device)
@@ -343,17 +364,21 @@ def run_inference_test(
             print(f"[Val] ✅ Saved: {out_path}")
             
             # Log to WandB
-            wandb.log({
-                "val/audio": wandb.Audio(str(out_path), caption=f"Step {step}"),
-                "val/step": step
-            })
+            if wandb.run is not None:
+                wandb.log({
+                    "val/audio": wandb.Audio(str(out_path), caption=f"Step {step}"),
+                    "val/step": step
+                })
 
     except Exception as e:
         print(f"[Val] ❌ Error: {e}")
     
     model.train()
 
-def train_step(model, batch_latents, optimizer, device):
+def train_step_forward(model, batch_latents, device):
+    """
+    Computes Loss ONLY. Does not step optimizer.
+    """
     model.train()
     latent = batch_latents["latent"]
     latent_mask = batch_latents["latent_mask"]
@@ -363,21 +388,34 @@ def train_step(model, batch_latents, optimizer, device):
     text_mask = batch_latents["text_mask"]
 
     B, T, _ = latent.shape
-    t = torch.rand(B, device=device)
+    
+    # --- EXPERT: Logit-Normal Sampling (Rectified Flow) ---
+    t = logit_normal_sample((B,), device, sigma=1.0)
+    
     noise = torch.randn_like(latent)
     t_broadcast = t.view(B, 1, 1)
     x_noised = latent * (1.0 - t_broadcast) + noise * t_broadcast
 
+    # --- EXPERT: Speaker Masking (Dropout) ---
+    speaker_dropout_prob = 0.1
+    # Create a mask: 1 = keep, 0 = drop
+    spk_drop_mask = (torch.rand((B,), device=device) > speaker_dropout_prob).float().view(B, 1, 1)
+    
+    # Apply dropout to latent
+    speaker_latent_dropped = speaker_latent * spk_drop_mask
+    
+    # Get KV Caches
     kv_text = model.get_kv_cache_text(text_input_ids, text_mask)
-    kv_speaker = model.get_kv_cache_speaker(speaker_latent.to(model.dtype))
+    kv_speaker = model.get_kv_cache_speaker(speaker_latent_dropped.to(model.dtype))
 
-    optimizer.zero_grad(set_to_none=True)
-
+    # 🛑 CRITICAL FIX: Cast mask to model.dtype (BFloat16)
+    speaker_mask_input = (speaker_mask * spk_drop_mask.squeeze(-1)).to(model.dtype)
+    
     v_pred = model(
         x=x_noised.to(model.dtype),
         t=t.to(model.dtype),
-        text_mask=text_mask,
-        speaker_mask=speaker_mask,
+        text_mask=text_mask, 
+        speaker_mask=speaker_mask_input, 
         kv_cache_text=kv_text,
         kv_cache_speaker=kv_speaker,
     ).float()
@@ -388,19 +426,20 @@ def train_step(model, batch_latents, optimizer, device):
         loss = (loss * lm).sum() / (lm.sum() + 1e-6)
     else:
         loss = loss.mean()
-
-    loss.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    return loss.detach().item(), grad_norm.item()
+        
+    return loss
 
 
 def cmd_train(
     segments_dir: Path, metadata: Path, out_dir: Path, lang: str | None,
     batch_size: int, steps: int, lr: float, device_str: str,
-    resume_path: Path | None, 
+    checkpoint_path: Path | None, 
     val_speaker: Path | None, val_text: str | None,
-    use_wandb: bool
+    use_wandb: bool,
+    grad_accum: int,
+    grad_norm: float,
+    weight_decay: float,
+    unfreeze_all: bool
 ) -> None:
     
     device = torch.device(device_str)
@@ -409,13 +448,14 @@ def cmd_train(
 
     # Initialize WandB
     if use_wandb:
-        wandb.init(project="echo-tts-finetune", name="abu-8hr-run")
+        wandb.init(project="echo-tts-finetune", name="abu-expert-run")
         wandb.config.update({
-            "lr": lr, "batch_size": batch_size, "steps": steps
+            "lr": lr, "batch_size": batch_size, "steps": steps,
+            "grad_accum": grad_accum, "weight_decay": weight_decay
         })
 
     dataset = EchoDataset(metadata)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=lambda x: x)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=lambda x: x, drop_last=True)
 
     print(f"[Train] Loading Model...")
     model = load_model_from_hf(device=device_str, dtype=torch.bfloat16, delete_blockwise_modules=True)
@@ -423,61 +463,96 @@ def cmd_train(
     pca_state = load_pca_state_from_hf()
 
     global_step = 0
-    if resume_path and resume_path.exists():
-        print(f"[Train] 🔄 Resuming from {resume_path}")
-        model.load_state_dict(torch.load(resume_path, map_location=device), strict=False)
-        match = re.search(r"step(\d+)", resume_path.stem)
+    if checkpoint_path and checkpoint_path.exists():
+        print(f"[Train] 🔄 Resuming from {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
+        match = re.search(r"step(\d+)", checkpoint_path.stem)
         if match:
             global_step = int(match.group(1))
     else:
         print("[Train] ⭐ Fresh Start")
 
     # Freeze Logic
-    print("[Train] Freezing Encoders...")
-    freeze_keywords = ["text", "speaker", "encoder", "embed", "condition"]
-    frozen_c, trainable_c = 0, 0
-    for name, param in model.named_parameters():
-        should_freeze = any(k in name for k in freeze_keywords) and "latent" not in name
-        if should_freeze:
-            param.requires_grad = False
-            frozen_c += param.numel()
-        else:
+    print("[Train] Configuring Layers...")
+    if unfreeze_all:
+        print("  🔓 UNFREEZING ALL LAYERS (Expert / Pre-training Mode)")
+        for param in model.parameters():
             param.requires_grad = True
-            trainable_c += param.numel()
-            
-    print(f"[Train] Trainable: {trainable_c/1e6:.1f}M | Frozen: {frozen_c/1e6:.1f}M")
+    else:
+        print("  🔒 Freezing Encoders (Standard Mode)")
+        freeze_keywords = ["text", "speaker", "encoder", "embed", "condition"]
+        frozen_c, trainable_c = 0, 0
+        for name, param in model.named_parameters():
+            should_freeze = any(k in name for k in freeze_keywords) and "latent" not in name
+            if should_freeze:
+                param.requires_grad = False
+                frozen_c += param.numel()
+            else:
+                param.requires_grad = True
+                trainable_c += param.numel()
+        print(f"[Train] Trainable: {trainable_c/1e6:.1f}M | Frozen: {frozen_c/1e6:.1f}M")
     
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    # Optimizer with Weight Decay
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=lr, 
+        weight_decay=weight_decay
+    )
 
-    print(f"[Train] Go for {steps} steps...")
+    print(f"[Train] Go for {steps} steps (Grad Accum: {grad_accum})...")
+    
+    optimizer.zero_grad()
     
     while global_step < steps:
         for batch in loader:
             if global_step >= steps: break
             
-            # Validation
-            if val_speaker and val_text and global_step % 500 == 0 and global_step > 0:
+            # --- Validation ---
+            if val_speaker and val_text and global_step % 1000 == 0 and global_step > 0:
                 run_inference_test(
                     model, fish_ae, pca_state, device, global_step,
                     val_speaker, val_text, 
                     cfg_text=4.0, cfg_speaker=2.0, kv_scale=1.2, kv_min_t=0.2
                 )
 
+            # --- Forward Pass ---
             batch_latents = build_batch_latents(batch, fish_ae, pca_state, device)
-            loss, grad_norm = train_step(model, batch_latents, optimizer, device)
+            
+            # Get loss
+            loss = train_step_forward(model, batch_latents, device)
+            
+            # Scale loss by accumulation steps
+            loss = loss / grad_accum
+            loss.backward()
+
+            # --- Optimization Step (Only every `grad_accum` batches) ---
+            if (global_step + 1) % grad_accum == 0:
+                # Clip Gradients
+                grad_norm_val = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm)
+                
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                # --- FIX: Log Every Optimization Step (or every few) ---
+                # Since this block only runs every 8 batches, we can print every time
+                # to ensure user sees progress.
+                
+                real_step = (global_step + 1) // grad_accum
+                
+                if use_wandb:
+                    wandb.log({
+                        "train/loss": loss.item() * grad_accum, 
+                        "train/grad_norm": grad_norm_val.item(),
+                        "train/step": global_step
+                    })
+                
+                # Print every single update (since they are slow/heavy)
+                print(f"[Train] Opt Step {real_step} (Batch {global_step+1}) | loss={loss.item() * grad_accum:.4f} | grad={grad_norm_val:.4f}")
+
             global_step += 1
 
-            if use_wandb:
-                wandb.log({
-                    "train/loss": loss,
-                    "train/grad_norm": grad_norm,
-                    "train/step": global_step
-                })
-
-            if global_step % 10 == 0:
-                print(f"[Train] step {global_step}/{steps} | loss={loss:.4f} | grad={grad_norm:.4f}")
-
-            if global_step % 1000 == 0 or global_step == steps:
+            # Checkpoint
+            if global_step % 3000 == 0 or global_step == steps:
                 ckpt = out_dir / f"echo_abu_step{global_step}.pt"
                 torch.save(model.state_dict(), ckpt)
                 print(f"[Train] Saved checkpoint → {ckpt}")
@@ -517,7 +592,16 @@ def main() -> None:
     p_train.add_argument("--steps", type=int, default=1000)
     p_train.add_argument("--lr", type=float, default=2e-5)
     p_train.add_argument("--device", type=str, default="cuda")
-    p_train.add_argument("--resume", type=Path, default=None)
+    
+    # Checkpoint args (Both aliases)
+    p_train.add_argument("--resume", type=Path, default=None, help="Legacy alias for checkpoint")
+    p_train.add_argument("--checkpoint", type=Path, default=None, help="Path to checkpoint .pt file")
+    
+    # Expert Training Args
+    p_train.add_argument("--grad_accum", type=int, default=1, help="Gradient Accumulation Steps")
+    p_train.add_argument("--grad_norm", type=float, default=1.0, help="Max Gradient Norm")
+    p_train.add_argument("--weight_decay", type=float, default=0.01, help="AdamW Weight Decay")
+    p_train.add_argument("--unfreeze_all", action="store_true", help="Unfreeze all layers (for Pre-training)")
     
     # Validation Args
     p_train.add_argument("--val_speaker", type=Path, default=None)
@@ -531,11 +615,18 @@ def main() -> None:
     elif args.cmd == "transcribe":
         cmd_transcribe(args.segments_dir, args.metadata, args.lang)
     elif args.cmd == "train":
+        # Handle checkpoint alias
+        ckpt = args.checkpoint if args.checkpoint else args.resume
+        
         cmd_train(
             args.segments_dir, args.metadata, args.out_dir, args.lang,
             args.batch_size, args.steps, args.lr, args.device, 
-            args.resume, args.val_speaker, args.val_text,
-            use_wandb=not args.no_wandb
+            ckpt, args.val_speaker, args.val_text,
+            use_wandb=not args.no_wandb,
+            grad_accum=args.grad_accum,
+            grad_norm=args.grad_norm,
+            weight_decay=args.weight_decay,
+            unfreeze_all=args.unfreeze_all
         )
 
 if __name__ == "__main__":
