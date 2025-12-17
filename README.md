@@ -19,18 +19,21 @@ Install echo-tts as normal.
 
 
 3. python finetune_cli.py train \
-  --resume "checkpoints/echo_arabic_base/echo_abu_step16000.pt" \
-  --segments_dir "Arabic_Base/segments" \
-  --metadata "Arabic_Base/metadata.jsonl" \
-  --out_dir "checkpoints/echo_arabic_base" \
+  --segments_dir "/root/echo-tts/XX/ar/segments" \
+  --metadata "/root/echo-tts/XX/ar/metadata.jsonl" \
+  --out_dir "checkpoints/XX" \
   --lang ar \
-  --batch_size 2 \
-  --steps 20000 \
-  --lr 2e-5 \
+  --batch_size 1 \
+  --grad_accum 16 \
+  --grad_norm 1.0 \
+  --lr 1e-4 \
+  --weight_decay 0.01 \
+  --steps 30000 \
   --device cuda \
-
+  --unfreeze_all
+   
 Inference :
-4. python infer_cli.py \
+5. python infer_cli.py \
   --checkpoint checkpoints/echo_abu_ar/echo_abu_final.pt \
   --speaker "/mnt/h/Audio/AbuTala/New folder/abu30sec.mp3" \
   --text "[S1] في يوم من الأيام، شاب فقير قرر يتحدى العالم، خسر كثير، لكنه تعلّم أكثر، واليوم صوته يحمل وجع الماضي وقوة الإصرار." \
